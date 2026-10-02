@@ -1,0 +1,386 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'QS_EOF_0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Arsili"
+          include(":app")
+          QS_EOF_0
+          cat > build.gradle.kts <<'QS_EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          QS_EOF_1
+          cat > gradle.properties <<'QS_EOF_2'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          QS_EOF_2
+          mkdir -p app
+          cat > app/build.gradle.kts <<'QS_EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.quickshare"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.quickshare"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("com.google.android.gms:play-services-nearby:19.3.0")
+          }
+          QS_EOF_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'QS_EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <!-- Nearby Connections may check location permission on newer Android versions too. -->
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+              <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" />
+
+              <application android:label="أرسلي" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          QS_EOF_4
+          mkdir -p app/src/main/java/com/example/quickshare
+          cat > app/src/main/java/com/example/quickshare/MainActivity.kt <<'QS_EOF_5'
+          package com.example.quickshare
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.provider.OpenableColumns
+          import android.content.res.ColorStateList
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.*
+          import com.google.android.gms.nearby.Nearby
+          import com.google.android.gms.nearby.connection.*
+
+          class MainActivity : Activity() {
+
+              private val SERVICE = "com.example.quickshare"
+              private val myName = Build.MODEL ?: "Android"
+              private val client by lazy { Nearby.getConnectionsClient(this) }
+
+              private val connected = mutableSetOf<String>()
+              private val picked = mutableListOf<Uri>()
+              private val names = mutableMapOf<Long, String>()
+              private val incoming = mutableMapOf<Long, Payload>()
+              private val openDescriptors = mutableMapOf<Long, android.os.ParcelFileDescriptor>()
+              private val completedFiles = mutableSetOf<Long>()
+
+              private lateinit var status: TextView
+              private lateinit var list: LinearLayout
+              private lateinit var senderPanel: LinearLayout
+              private lateinit var devicesLabel: TextView
+              private lateinit var bar: ProgressBar
+              private lateinit var sendCard: LinearLayout
+              private lateinit var recvCard: LinearLayout
+
+              private val BG = Color.parseColor("#0F172A")
+              private val CARD = Color.parseColor("#1E293B")
+              private val TEAL = Color.parseColor("#14B8A6")
+              private val GREEN = Color.parseColor("#22C55E")
+              private val RED = Color.parseColor("#EF4444")
+              private val MUTED = Color.parseColor("#94A3B8")
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+              private fun round(color: Int, r: Int = 18, stroke: Int = 0) = GradientDrawable().apply {
+                  setColor(color); cornerRadius = dp(r).toFloat(); if (stroke != 0) setStroke(dp(2), stroke)
+              }
+              private fun btn(t: String, color: Int, outline: Boolean = false) = Button(this).apply {
+                  text = t; isAllCaps = false; textSize = 16f; setTypeface(null, Typeface.BOLD)
+                  setTextColor(if (outline) color else Color.WHITE)
+                  background = if (outline) round(Color.TRANSPARENT, 16, color) else round(color, 16)
+                  stateListAnimator = null
+                  layoutParams = LinearLayout.LayoutParams(-1, dp(54)).apply { topMargin = dp(10) }
+              }
+              private fun label(t: String, size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+                  text = t; textSize = size; setTextColor(color); if (bold) setTypeface(null, Typeface.BOLD)
+                  textAlignment = View.TEXT_ALIGNMENT_VIEW_START
+              }
+              private fun modeCard(icon: String, title: String, sub: String, click: () -> Unit) = LinearLayout(this).apply {
+                  orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+                  setPadding(dp(12), dp(22), dp(12), dp(22)); background = round(CARD)
+                  layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(6), 0, dp(6), 0) }
+                  addView(TextView(context).apply { text = icon; textSize = 38f; gravity = Gravity.CENTER })
+                  addView(label(title, 17f, Color.WHITE, true).apply { gravity = Gravity.CENTER; textAlignment = View.TEXT_ALIGNMENT_CENTER })
+                  addView(label(sub, 12f, MUTED).apply { gravity = Gravity.CENTER; textAlignment = View.TEXT_ALIGNMENT_CENTER })
+                  setOnClickListener { click() }
+              }
+              private fun select(card: LinearLayout?) {
+                  sendCard.background = round(CARD, 18, if (card == sendCard) TEAL else 0)
+                  recvCard.background = round(CARD, 18, if (card == recvCard) TEAL else 0)
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.statusBarColor = BG; window.navigationBarColor = BG
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(40), dp(18), dp(30))
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  }
+                  col.addView(label("⚡ أرسلي", 30f, Color.WHITE, true))
+                  col.addView(label("انقل ملفاتك بين الأجهزة بدون إنترنت", 14f, MUTED).apply { setPadding(0, dp(4), 0, dp(24)) })
+
+                  sendCard = modeCard("📤", "إرسال", "أنا المرسل") { run { startSender() } }
+                  recvCard = modeCard("📥", "استقبال", "ابحث عن مرسل") { run { startReceiver() } }
+                  col.addView(LinearLayout(this).apply { addView(sendCard); addView(recvCard) })
+
+                  val statusBox = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(16), dp(18), dp(16)); background = round(CARD)
+                      layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(18) }
+                  }
+                  status = label("اختر إرسال أو استقبال للبدء", 15f, Color.WHITE)
+                  bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                      max = 100; visibility = View.GONE; progressTintList = ColorStateList.valueOf(TEAL)
+                      layoutParams = LinearLayout.LayoutParams(-1, dp(10)).apply { topMargin = dp(12) }
+                  }
+                  statusBox.addView(status); statusBox.addView(bar); col.addView(statusBox)
+
+                  senderPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+                  senderPanel.addView(btn("📁  اختيار الملفات", TEAL, true).apply { setOnClickListener { pickFiles() } })
+                  senderPanel.addView(btn("🚀  إرسال للأجهزة المتصلة", GREEN).apply { setOnClickListener { sendFiles() } })
+                  col.addView(senderPanel)
+
+                  devicesLabel = label("الأجهزة القريبة", 14f, MUTED, true).apply { visibility = View.GONE; setPadding(0, dp(20), 0, dp(4)) }
+                  list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  col.addView(devicesLabel); col.addView(list)
+                  col.addView(btn("⏹  إيقاف", RED, true).apply { (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24); setOnClickListener { stopAll(); select(null); status.text = "تم الإيقاف" } })
+
+                  setContentView(ScrollView(this).apply { setBackgroundColor(BG); isFillViewport = true; addView(col) })
+              }
+
+              // ---------- الصلاحيات ----------
+              private var pending: (() -> Unit)? = null
+              private fun granted(p: String) = checkSelfPermission(p) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+              private fun run(action: () -> Unit) {
+                  val required = mutableListOf<String>()
+                  // Request location permissions as the Nearby SDK may require them even on newer OS versions.
+                  required += listOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      required += listOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
+                  }
+                  if (Build.VERSION.SDK_INT >= 33) required += Manifest.permission.NEARBY_WIFI_DEVICES
+                  val missing = required.distinct().filter { !granted(it) }
+                  if (missing.isEmpty()) action() else {
+                      pending = action
+                      requestPermissions(missing.toTypedArray(), 1)
+                  }
+              }
+
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
+                  super.onRequestPermissionsResult(c, p, r)
+                  if (c != 1) return
+                  val required = mutableListOf<String>()
+                  required += listOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
+                  if (Build.VERSION.SDK_INT >= 31) required += listOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+                  if (Build.VERSION.SDK_INT >= 33) required += Manifest.permission.NEARBY_WIFI_DEVICES
+                  if (required.all { granted(it) }) pending?.invoke()
+                  else status.text = "لم تُمنح كل الصلاحيات المطلوبة. فعّل صلاحيات الأجهزة القريبة ثم حاول مجدداً."
+                  pending = null
+              }
+
+              // ---------- المرسل ----------
+              private fun startSender() {
+                  stopAll()
+                  client.startAdvertising(myName, SERVICE, connCb,
+                      AdvertisingOptions.Builder().setStrategy(Strategy.P2P_STAR).build())
+                      .addOnSuccessListener { status.text = "المرسل جاهز ✅ انتظر اتصال الأجهزة..."; senderPanel.visibility = View.VISIBLE; select(sendCard) }
+                      .addOnFailureListener { status.text = "فشل: ${it.message} (Android ${Build.VERSION.SDK_INT})" }
+              }
+
+              private fun pickFiles() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                      type = "*/*"; addCategory(Intent.CATEGORY_OPENABLE); putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                  }
+                  startActivityForResult(i, 2)
+              }
+
+              override fun onActivityResult(req: Int, res: Int, d: Intent?) {
+                  if (req == 2 && res == RESULT_OK && d != null) {
+                      picked.clear()
+                      d.clipData?.let { for (i in 0 until it.itemCount) picked += it.getItemAt(i).uri } ?: d.data?.let { picked += it }
+                      status.text = "تم اختيار ${picked.size} ملف | المتصلون: ${connected.size}"
+                  }
+              }
+
+              private fun sendFiles() {
+                  if (connected.isEmpty()) { status.text = "لا يوجد أجهزة متصلة بعد"; return }
+                  if (picked.isEmpty()) { status.text = "اختر ملفات أولاً"; return }
+                  val targets = connected.toList()
+                  for (uri in picked) {
+                      try {
+                          val name = contentResolver.query(uri, null, null, null, null)?.use { c ->
+                              if (c.moveToFirst()) c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) else null
+                          } ?: "file_${System.currentTimeMillis()}"
+                          val pfd = contentResolver.openFileDescriptor(uri, "r") ?: continue
+                          val file = Payload.fromFile(pfd)
+                          openDescriptors[file.id] = pfd
+                          names[file.id] = name
+                          client.sendPayload(targets, Payload.fromBytes("${file.id}:$name".toByteArray()))
+                              .addOnFailureListener { status.text = "تعذر إرسال بيانات الملف: ${it.message}" }
+                          client.sendPayload(targets, file)
+                              .addOnFailureListener { status.text = "تعذر إرسال الملف: ${it.message}"; openDescriptors.remove(file.id)?.close() }
+                      } catch (e: Exception) { status.text = "خطأ: ${e.message}" }
+                  }
+                  status.text = "جاري الإرسال إلى ${targets.size} جهاز..."
+              }
+
+              // ---------- المستقبل ----------
+              private fun startReceiver() {
+                  stopAll()
+                  client.startDiscovery(SERVICE, object : EndpointDiscoveryCallback() {
+                      override fun onEndpointFound(id: String, info: DiscoveredEndpointInfo) {
+                          if (list.findViewWithTag<View>(id) != null) return
+                          val b = btn("📱  ${info.endpointName}", TEAL).apply {
+                              tag = id
+                              setOnClickListener { isEnabled = false; client.requestConnection(myName, id, connCb).addOnFailureListener { isEnabled = true; status.text = "تعذر بدء الاتصال: ${it.message}" }; status.text = "جاري الاتصال..." }
+                          }
+                          list.addView(b)
+                      }
+                      override fun onEndpointLost(id: String) { list.findViewWithTag<View>(id)?.let { list.removeView(it) } }
+                  }, DiscoveryOptions.Builder().setStrategy(Strategy.P2P_STAR).build())
+                      .addOnSuccessListener { status.text = "أبحث عن مرسلين قريبين... 🔍"; devicesLabel.visibility = View.VISIBLE; select(recvCard) }
+                      .addOnFailureListener { status.text = "فشل: ${it.message} (Android ${Build.VERSION.SDK_INT})" }
+              }
+
+              // ---------- مشترك ----------
+              private val connCb = object : ConnectionLifecycleCallback() {
+                  override fun onConnectionInitiated(id: String, info: ConnectionInfo) {
+                      runOnUiThread {
+                          android.app.AlertDialog.Builder(this@MainActivity)
+                              .setTitle("طلب اتصال")
+                              .setMessage("الجهاز ${info.endpointName} يريد الاتصال. رمز التحقق: ${info.authenticationDigits}")
+                              .setNegativeButton("رفض") { _, _ -> client.rejectConnection(id) }
+                              .setPositiveButton("قبول") { _, _ -> client.acceptConnection(id, payloadCb).addOnFailureListener { status.text = "تعذر قبول الاتصال: ${it.message}" } }
+                              .setOnCancelListener { client.rejectConnection(id) }
+                              .show()
+                      }
+                  }
+                  override fun onConnectionResult(id: String, r: ConnectionResolution) {
+                      if (r.status.isSuccess) { connected += id; status.text = "متصل ✔ (عدد الأجهزة: ${connected.size})" }
+                      else status.text = "فشل الاتصال"
+                  }
+                  override fun onDisconnected(id: String) { connected -= id; status.text = "انقطع جهاز (المتبقي: ${connected.size})" }
+              }
+
+              private val payloadCb = object : PayloadCallback() {
+                  override fun onPayloadReceived(id: String, p: Payload) {
+                      if (p.type == Payload.Type.BYTES) {
+                          val s = String(p.asBytes() ?: return); val i = s.indexOf(':')
+                          if (i > 0) {
+                              val payloadId = s.substring(0, i).toLongOrNull()
+                              if (payloadId != null) {
+                                  names[payloadId] = s.substring(i + 1)
+                                  if (completedFiles.remove(payloadId)) incoming.remove(payloadId)?.let { payload -> Thread { save(payload) }.start() }
+                              }
+                          }
+                      } else if (p.type == Payload.Type.FILE) incoming[p.id] = p
+                  }
+                  override fun onPayloadTransferUpdate(id: String, u: PayloadTransferUpdate) {
+                      when (u.status) {
+                          PayloadTransferUpdate.Status.IN_PROGRESS ->
+                              if (u.totalBytes > 0) { val pc = (u.bytesTransferred * 100 / u.totalBytes).toInt(); bar.visibility = View.VISIBLE; bar.progress = pc; status.text = "جاري النقل: $pc%" }
+                          PayloadTransferUpdate.Status.SUCCESS -> {
+                              bar.visibility = View.GONE; status.text = "اكتمل النقل ✔"
+                              if (names.containsKey(u.payloadId)) incoming.remove(u.payloadId)?.let { p -> Thread { save(p) }.start() }
+                              else completedFiles += u.payloadId
+                          }
+                          PayloadTransferUpdate.Status.FAILURE -> {
+                              openDescriptors.remove(u.payloadId)?.let { try { it.close() } catch (_: Exception) {} }
+                              incoming.remove(u.payloadId); completedFiles.remove(u.payloadId); names.remove(u.payloadId)
+                              status.text = "فشل النقل"
+                          }
+                          else -> {}
+                      }
+                  }
+              }
+
+              private fun save(p: Payload) {
+                  try {
+                      val src = p.asFile()?.asUri() ?: return
+                      val rawName = names.remove(p.id) ?: "file_${p.id}"
+                      val name = rawName.substringAfterLast('/').substringAfterLast('\\').replace(Regex("[\\\\u0000-\\u001F:*?\"<>|]"), "_").ifBlank { "file_${p.id}" }
+                      val v = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, name)
+                          put(MediaStore.Downloads.RELATIVE_PATH, "Download/Arsili")
+                      }
+                      val out = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: throw IllegalStateException("تعذر إنشاء ملف في التنزيلات")
+                      try {
+                          val input = contentResolver.openInputStream(src) ?: throw IllegalStateException("تعذر قراءة الملف المستلم")
+                          val output = contentResolver.openOutputStream(out) ?: throw IllegalStateException("تعذر فتح ملف الحفظ")
+                          input.use { i -> output.use { o -> i.copyTo(o) } }
+                          runOnUiThread { status.text = "تم الحفظ: Download/Arsili/$name" }
+                      } catch (e: Exception) {
+                          contentResolver.delete(out, null, null)
+                          throw e
+                      }
+                  } catch (e: Exception) { runOnUiThread { status.text = "خطأ بالحفظ: ${e.message ?: "مشكلة غير معروفة"}" } }
+              }
+
+              private fun stopAll() {
+                  client.stopAdvertising(); client.stopDiscovery(); client.stopAllEndpoints()
+                  connected.clear(); list.removeAllViews(); openDescriptors.values.forEach { try { it.close() } catch (_: Exception) {} }; openDescriptors.clear(); incoming.clear(); names.clear(); completedFiles.clear(); senderPanel.visibility = View.GONE; devicesLabel.visibility = View.GONE; bar.visibility = View.GONE
+              }
+
+              override fun onDestroy() { stopAll(); super.onDestroy() }
+          }
+          QS_EOF_5
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v5
+        with:
+          name: Arsili-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
