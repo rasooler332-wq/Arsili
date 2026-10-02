@@ -66,8 +66,9 @@ jobs:
               <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
-              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="32" />
-              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32" />
+              <!-- Nearby Connections may check location permission on newer Android versions too. -->
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
               <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
@@ -207,10 +208,10 @@ jobs:
 
               private fun run(action: () -> Unit) {
                   val required = mutableListOf<String>()
+                  // Request location permissions as the Nearby SDK may require them even on newer OS versions.
+                  required += listOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
                   if (Build.VERSION.SDK_INT >= 31) {
                       required += listOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
-                  } else {
-                      required += Manifest.permission.ACCESS_FINE_LOCATION
                   }
                   if (Build.VERSION.SDK_INT >= 33) required += Manifest.permission.NEARBY_WIFI_DEVICES
                   val missing = required.distinct().filter { !granted(it) }
@@ -224,8 +225,8 @@ jobs:
                   super.onRequestPermissionsResult(c, p, r)
                   if (c != 1) return
                   val required = mutableListOf<String>()
+                  required += listOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
                   if (Build.VERSION.SDK_INT >= 31) required += listOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
-                  else required += Manifest.permission.ACCESS_FINE_LOCATION
                   if (Build.VERSION.SDK_INT >= 33) required += Manifest.permission.NEARBY_WIFI_DEVICES
                   if (required.all { granted(it) }) pending?.invoke()
                   else status.text = "لم تُمنح كل الصلاحيات المطلوبة. فعّل صلاحيات الأجهزة القريبة ثم حاول مجدداً."
@@ -332,54 +333,4 @@ jobs:
                   override fun onPayloadTransferUpdate(id: String, u: PayloadTransferUpdate) {
                       when (u.status) {
                           PayloadTransferUpdate.Status.IN_PROGRESS ->
-                              if (u.totalBytes > 0) { val pc = (u.bytesTransferred * 100 / u.totalBytes).toInt(); bar.visibility = View.VISIBLE; bar.progress = pc; status.text = "جاري النقل: $pc%" }
-                          PayloadTransferUpdate.Status.SUCCESS -> {
-                              bar.visibility = View.GONE; status.text = "اكتمل النقل ✔"
-                              if (names.containsKey(u.payloadId)) incoming.remove(u.payloadId)?.let { p -> Thread { save(p) }.start() }
-                              else completedFiles += u.payloadId
-                          }
-                          PayloadTransferUpdate.Status.FAILURE -> {
-                              openDescriptors.remove(u.payloadId)?.let { try { it.close() } catch (_: Exception) {} }
-                              incoming.remove(u.payloadId); completedFiles.remove(u.payloadId); names.remove(u.payloadId)
-                              status.text = "فشل النقل"
-                          }
-                          else -> {}
-                      }
-                  }
-              }
-
-              private fun save(p: Payload) {
-                  try {
-                      val src = p.asFile()?.asUri() ?: return
-                      val rawName = names.remove(p.id) ?: "file_${p.id}"
-                      val name = rawName.substringAfterLast('/').substringAfterLast('\\').replace(Regex("[\\\\u0000-\\u001F:*?\"<>|]"), "_").ifBlank { "file_${p.id}" }
-                      val v = ContentValues().apply {
-                          put(MediaStore.Downloads.DISPLAY_NAME, name)
-                          put(MediaStore.Downloads.RELATIVE_PATH, "Download/Arsili")
-                      }
-                      val out = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: throw IllegalStateException("تعذر إنشاء ملف في التنزيلات")
-                      try {
-                          val input = contentResolver.openInputStream(src) ?: throw IllegalStateException("تعذر قراءة الملف المستلم")
-                          val output = contentResolver.openOutputStream(out) ?: throw IllegalStateException("تعذر فتح ملف الحفظ")
-                          input.use { i -> output.use { o -> i.copyTo(o) } }
-                          runOnUiThread { status.text = "تم الحفظ: Download/Arsili/$name" }
-                      } catch (e: Exception) {
-                          contentResolver.delete(out, null, null)
-                          throw e
-                      }
-                  } catch (e: Exception) { runOnUiThread { status.text = "خطأ بالحفظ: ${e.message ?: "مشكلة غير معروفة"}" } }
-              }
-
-              private fun stopAll() {
-                  client.stopAdvertising(); client.stopDiscovery(); client.stopAllEndpoints()
-                  connected.clear(); list.removeAllViews(); openDescriptors.values.forEach { try { it.close() } catch (_: Exception) {} }; openDescriptors.clear(); incoming.clear(); names.clear(); completedFiles.clear(); senderPanel.visibility = View.GONE; devicesLabel.visibility = View.GONE; bar.visibility = View.GONE
-              }
-
-              override fun onDestroy() { stopAll(); super.onDestroy() }
-          }
-          QS_EOF_5
-      - run: gradle assembleDebug
-      - uses: actions/upload-artifact@v5
-        with:
-          name: Arsili-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+                              if (u.totalBytes > 0) { val pc = (u.bytesTransferred * 
