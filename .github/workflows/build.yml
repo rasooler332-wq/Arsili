@@ -45,8 +45,8 @@ jobs:
                   applicationId = "com.example.quickshare"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -119,6 +119,9 @@ jobs:
               private val incoming = mutableMapOf<Long, Payload>()
               private val openDescriptors = mutableMapOf<Long, android.os.ParcelFileDescriptor>()
               private val completedFiles = mutableSetOf<Long>()
+              private val transferTargets = mutableMapOf<Long, MutableSet<String>>()
+              private val stateLock = Any()
+              private fun ui(block: () -> Unit) { runOnUiThread { if (!isFinishing && !isDestroyed) block() } }
 
               private lateinit var status: TextView
               private lateinit var list: LinearLayout
@@ -208,8 +211,9 @@ jobs:
 
               private fun run(action: () -> Unit) {
                   val required = mutableListOf<String>()
-                  // Request location permissions as the Nearby SDK may require them even on newer OS versions.
-                  required += listOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
+                  // Request coarse location explicitly because Nearby reports it as required.
+                  required += Manifest.permission.ACCESS_COARSE_LOCATION
+                  if (Build.VERSION.SDK_INT <= 32) required += Manifest.permission.ACCESS_FINE_LOCATION
                   if (Build.VERSION.SDK_INT >= 31) {
                       required += listOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
                   }
@@ -225,11 +229,15 @@ jobs:
                   super.onRequestPermissionsResult(c, p, r)
                   if (c != 1) return
                   val required = mutableListOf<String>()
-                  required += listOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
+                  required += Manifest.permission.ACCESS_COARSE_LOCATION
+                  if (Build.VERSION.SDK_INT <= 32) required += Manifest.permission.ACCESS_FINE_LOCATION
                   if (Build.VERSION.SDK_INT >= 31) required += listOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
                   if (Build.VERSION.SDK_INT >= 33) required += Manifest.permission.NEARBY_WIFI_DEVICES
                   if (required.all { granted(it) }) pending?.invoke()
-                  else status.text = "لم تُمنح كل الصلاحيات المطلوبة. فعّل صلاحيات الأجهزة القريبة ثم حاول مجدداً."
+                  else {
+                      val permanentlyDenied = p.indices.any { i -> !granted(p[i]) && !shouldShowRequestPermissionRationale(p[i]) }
+                      ui { status.text = if (permanentlyDenied) "الصلاحية مرفوضة نهائياً. افتح إعدادات التطبيق > الأذونات وفعّل الصلاحيات المطلوبة." else "لم تُمنح الصلاحيات المطلوبة. وافق عليها ثم حاول مجدداً." }
+                  }
                   pending = null
               }
 
@@ -266,17 +274,26 @@ jobs:
                           val name = contentResolver.query(uri, null, null, null, null)?.use { c ->
                               if (c.moveToFirst()) c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) else null
                           } ?: "file_${System.currentTimeMillis()}"
-                          val pfd = contentResolver.openFileDescriptor(uri, "r") ?: continue
+                          val pfd = contentResolver.openFileDescriptor(uri, "r") ?: throw IllegalStateException("تعذر فتح الملف المحدد")
                           val file = Payload.fromFile(pfd)
-                          openDescriptors[file.id] = pfd
-                          names[file.id] = name
+                          synchronized(stateLock) {
+                              openDescriptors[file.id] = pfd
+                              names[file.id] = name
+                              transferTargets[file.id] = targets.toMutableSet()
+                          }
                           client.sendPayload(targets, Payload.fromBytes("${file.id}:$name".toByteArray()))
-                              .addOnFailureListener { status.text = "تعذر إرسال بيانات الملف: ${it.message}" }
+                              .addOnFailureListener { e -> ui { status.text = "تعذر إرسال بيانات الملف: ${e.message}" } }
                           client.sendPayload(targets, file)
-                              .addOnFailureListener { status.text = "تعذر إرسال الملف: ${it.message}"; openDescriptors.remove(file.id)?.close() }
+                              .addOnFailureListener { e ->
+                                  synchronized(stateLock) {
+                                      try { openDescriptors.remove(file.id)?.close() } catch (_: Exception) {}
+                                      transferTargets.remove(file.id); names.remove(file.id)
+                                  }
+                                  ui { status.text = "تعذر إرسال الملف: ${e.message}" }
+                              }
                       } catch (e: Exception) { status.text = "خطأ: ${e.message}" }
                   }
-                  status.text = "جاري الإرسال إلى ${targets.size} جهاز..."
+                  ui { status.text = "جاري الإرسال إلى ${targets.size} جهاز..." }
               }
 
               // ---------- المستقبل ----------
@@ -284,14 +301,14 @@ jobs:
                   stopAll()
                   client.startDiscovery(SERVICE, object : EndpointDiscoveryCallback() {
                       override fun onEndpointFound(id: String, info: DiscoveredEndpointInfo) {
-                          if (list.findViewWithTag<View>(id) != null) return
+                          ui { if (list.findViewWithTag<View>(id) != null) return@ui
                           val b = btn("📱  ${info.endpointName}", TEAL).apply {
                               tag = id
                               setOnClickListener { isEnabled = false; client.requestConnection(myName, id, connCb).addOnFailureListener { isEnabled = true; status.text = "تعذر بدء الاتصال: ${it.message}" }; status.text = "جاري الاتصال..." }
                           }
-                          list.addView(b)
+                          list.addView(b) }
                       }
-                      override fun onEndpointLost(id: String) { list.findViewWithTag<View>(id)?.let { list.removeView(it) } }
+                      override fun onEndpointLost(id: String) { ui { list.findViewWithTag<View>(id)?.let { list.removeView(it) } } }
                   }, DiscoveryOptions.Builder().setStrategy(Strategy.P2P_STAR).build())
                       .addOnSuccessListener { status.text = "أبحث عن مرسلين قريبين... 🔍"; devicesLabel.visibility = View.VISIBLE; select(recvCard) }
                       .addOnFailureListener { status.text = "فشل: ${it.message} (Android ${Build.VERSION.SDK_INT})" }
@@ -311,26 +328,9 @@ jobs:
                       }
                   }
                   override fun onConnectionResult(id: String, r: ConnectionResolution) {
-                      if (r.status.isSuccess) { connected += id; status.text = "متصل ✔ (عدد الأجهزة: ${connected.size})" }
-                      else status.text = "فشل الاتصال"
+                      ui {
+                          if (r.status.isSuccess) { connected += id; status.text = "متصل ✔ (عدد الأجهزة: ${connected.size})" }
+                          else status.text = "فشل الاتصال"
+                      }
                   }
-                  override fun onDisconnected(id: String) { connected -= id; status.text = "انقطع جهاز (المتبقي: ${connected.size})" }
-              }
-
-              private val payloadCb = object : PayloadCallback() {
-                  override fun onPayloadReceived(id: String, p: Payload) {
-                      if (p.type == Payload.Type.BYTES) {
-                          val s = String(p.asBytes() ?: return); val i = s.indexOf(':')
-                          if (i > 0) {
-                              val payloadId = s.substring(0, i).toLongOrNull()
-                              if (payloadId != null) {
-                                  names[payloadId] = s.substring(i + 1)
-                                  if (completedFiles.remove(payloadId)) incoming.remove(payloadId)?.let { payload -> Thread { save(payload) }.start() }
-                              }
-                          }
-                      } else if (p.type == Payload.Type.FILE) incoming[p.id] = p
-                  }
-                  override fun onPayloadTransferUpdate(id: String, u: PayloadTransferUpdate) {
-                      when (u.status) {
-                          PayloadTransferUpdate.Status.IN_PROGRESS ->
-                              if (u.totalBytes > 0) { val pc = (u.bytesTransferred * 
+                  override fun onDisconnect
